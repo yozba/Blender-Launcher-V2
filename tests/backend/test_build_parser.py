@@ -13,7 +13,7 @@ from source.modules.build_info import (
     parse_blender_ver,
 )
 from source.modules.platform_utils import get_platform
-from source.modules.settings import get_bash_arguments, set_bash_arguments
+from source.modules.settings import get_bash_arguments, get_use_nohup, set_bash_arguments
 from tests.config import SKIP_TESTS_THAT_MODIFY_CONFIG
 
 
@@ -49,7 +49,7 @@ def test_parser():
 )
 def test_get_args():
     root = os.path.abspath(os.sep)
-    win_root = root.replace("\\", "")
+    win_root = root.rstrip("\\")
     info = BuildInfo(os.path.join(root, "blender"), "4.0.0", "ffffffff", datetime.datetime(2024, 12, 12), "daily")  # noqa: DTZ001
     info_c = BuildInfo(
         os.path.join(root, "blender"),
@@ -62,53 +62,64 @@ def test_get_args():
 
     idx = ["Windows", "Linux", "macOS"].index(get_platform())
 
+    bstr = ""
     if idx == 1:
         bargs = get_bash_arguments()
+        nohupArgs = get_use_nohup()
+        if nohupArgs:
+            bstr = "nohup"
         set_bash_arguments("")
-
+        #set_use_nohup(False)
     x = [
         (
             get_args(info=info),
-            [win_root + "/blender/blender.exe"],
-            'nohup "/blender/blender" ',
+            [win_root + "\\blender\\blender.exe"],
+            f'{bstr} "/blender/blender" ',
             "open -W -n /blender/Blender/Blender.app --args",
         ),
         (
             get_args(info=info, linux_nohup=False),
-            [win_root + "/blender/blender.exe"],
+            [win_root + "\\blender\\blender.exe"],
             ' "/blender/blender" ',
             "open -W -n /blender/Blender/Blender.app --args",
         ),
         (
-            get_args(info=info, exe="bforartists.exe"),
-            ["cmd", "/C", win_root + "/blender/bforartists.exe"],
+            get_args(info=info, linux_nohup=True),
+            [win_root + "\\blender\\blender.exe"],
             'nohup "/blender/blender" ',
             "open -W -n /blender/Blender/Blender.app --args",
         ),
         (
+            get_args(info=info, exe="bforartists.exe"),
+            ["cmd", "/C", win_root + "\\blender\\bforartists.exe"],
+            f'{bstr} "/blender/blender" ',
+            "open -W -n /blender/Blender/Blender.app --args",
+        ),
+        (
             get_args(info=info_c),
-            [win_root + "/blender/bforartists"],
-            'nohup "/blender/bforartists" ',
+            [win_root + "\\blender\\bforartists"],
+            f'{bstr} "/blender/bforartists" ',
             "open -W -n /blender/Blender/Blender.app --args",
         ),
         (
             get_args(info=info, launch_mode=LaunchOpenLast()),
-            [win_root + "/blender/blender.exe", "--open-last"],
-            'nohup "/blender/blender"  --open-last',
+            [win_root + "\\blender\\blender.exe", "--open-last"],
+            f'{bstr} "/blender/blender"  --open-last',
             "open -W -n /blender/Blender/Blender.app --args --open-last",
         ),
         (
             get_args(info=info, launch_mode=LaunchWithBlendFile(Path(root) / "file.blend")),
-            [win_root + "/blender/blender.exe", win_root + "/file.blend"],
-            'nohup "/blender/blender"  "/file.blend"',
+            [win_root + "\\blender\\blender.exe", win_root + "\\file.blend"],
+            f'{bstr} "/blender/blender"  "/file.blend"',
             'open -W -n /blender/Blender/Blender.app --args --open-last "/file.blend"',
         ),
     ]
+
+    if idx == 1:
+        set_bash_arguments(bargs)
+
     from pprint import pprint
 
     for i in x:
         pprint(i)
         assert i[0] == i[idx + 1]
-
-    if idx == 1:
-        set_bash_arguments(bargs)

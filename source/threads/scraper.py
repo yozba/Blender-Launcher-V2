@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 from modules.build_info import BuildInfo
 from modules.platform_utils import get_architecture, get_platform
 from modules.settings import (
+    get_check_for_new_builds_automatically,
     get_last_time_checked_utc,
+    get_new_builds_check_frequency,
     get_scrape_bfa_builds,
     get_scrape_daily_builds,
     get_scrape_experimental_builds,
@@ -21,7 +23,7 @@ from modules.settings import (
     get_show_patch_archive_builds,
     set_last_time_checked_utc,
 )
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 from threads.scraping.automated import ScraperAutomated, ScraperPatch
 from threads.scraping.bfa import ScraperBfa
 from threads.scraping.launcher_updates import LauncherDataUpdater
@@ -43,8 +45,9 @@ class Scraper(QThread):
 
     def __init__(self, parent, man: ConnectionManager, build_cache=False):
         QThread.__init__(self)
+        self.setObjectName("Scraper Thread")
         self.parent = parent
-        self.manager = man
+        self._manager = man
         self.build_cache = build_cache
         self.current_version = parent.version
 
@@ -71,6 +74,24 @@ class Scraper(QThread):
         self.launcher_data_updater = LauncherDataUpdater(self.manager)
 
         self._latest_tag_cache = None
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(get_new_builds_check_frequency() * 3600000)  # `N`h to ms
+        # self.timer.setInterval(20_000)  # 20s to ms
+        self.timer.setSingleShot(True)
+
+    @property
+    def manager(self):
+        return self._manager
+
+    @manager.setter
+    def manager(self, man: ConnectionManager):
+        self._manager = man
+        self.scraper_stable.manager = man
+        self.scraper_upbge_stable.manager = man
+        self.scraper_upbge_weekly.manager = man
+        self.scraper_patch.manager = man
+        self.scraper_patch.label_fetcher.manager = man
 
     def run(self):
         self.launcher_data_updater.get_api_data_updates()
@@ -145,3 +166,12 @@ class Scraper(QThread):
         dt = datetime.fromtimestamp(mktime(utcnow)).astimezone()
         set_last_time_checked_utc(dt)
         self.last_time_checked = dt
+
+    def start_timer_if_allowed(self, force=False):
+        if force or (get_check_for_new_builds_automatically() and get_new_builds_check_frequency() > 0):
+            self.timer.start()
+            logging.debug("Scrape timer started.")
+
+    def stop_timer(self):
+        self.timer.stop()
+        logging.debug("Scrape timer stopped.")

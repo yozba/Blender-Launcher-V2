@@ -8,6 +8,8 @@ import shutil
 from typing import TypedDict
 
 import distro
+from i18n import t
+from modules.connection_manager import ConnectionManager
 from modules.platform_utils import _check_call, _popen, get_cwd, get_platform, get_running_app_bundle
 from modules.tasks import TaskQueue
 from PySide6.QtCore import Qt
@@ -43,18 +45,23 @@ class GitHubRelease(TypedDict):
 
 class BlenderLauncherUpdater(BaseWindow):
     def __init__(self, app: QApplication, version, release_tag: str | None = None):
-        super().__init__(app=app, version=version)
+        super().__init__()
+
+        self.app = app
+        self.cm = ConnectionManager(version=version)
+        self.cm.setup()
+        self.manager = self.cm.manager
 
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.resize(256, 77)
-        self.setWindowTitle("Updating Blender Launcher")
+        self.setWindowTitle(t("msg.updating_launcher"))
 
         self.CentralWidget = QWidget(self)
         self.CentralLayout = QVBoxLayout(self.CentralWidget)
         self.CentralLayout.setContentsMargins(3, 0, 3, 3)
         self.setCentralWidget(self.CentralWidget)
 
-        self.HeaderLabel = QLabel("Updating Blender Launcher")
+        self.HeaderLabel = QLabel(t("msg.updating_launcher"))
         self.HeaderLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.ProgressBar = BaseProgressBarWidget(self)
@@ -170,7 +177,7 @@ class BlenderLauncherUpdater(BaseWindow):
             _popen([launcher], no_console=False)
         elif self.platform == "Linux":
             os.chmod(dist, 0o744)
-            _popen('nohup "' + launcher + '"')
+            _popen('"' + launcher + '"')
         elif self.platform == "macOS":
             launcher = str(self._install_macos_app(dist))
             with contextlib.suppress(Exception):

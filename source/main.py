@@ -41,8 +41,8 @@ from utils.logger import setup_logging
 
 version = Version(
     2,
-    7,
-    6,
+    8,
+    1,
     # prerelease="rc.1",
 )
 
@@ -264,7 +264,6 @@ def start_set_library_folder(app: QApplication, lib_folder: str):
         Popup.warning(
             message=t("msg.err.folder_invalid"),
             buttons=Popup.Button.QUIT,
-            app=app,
         ).show()
         sys.exit(app.exec())
 
@@ -305,7 +304,7 @@ def start_update(app: QApplication, is_instanced: bool, tag: str | None):
             _popen([blu_name, "--instanced", "update"], no_console=False)
         elif get_platform() == "Linux":
             os.chmod(blu_name, 0o744)
-            _popen(f'nohup "{blu_name}" --instanced update')
+            _popen(f' "{blu_name}" --instanced update')
         sys.exit(0)
 
 
@@ -346,7 +345,7 @@ def start_launch(
         )
         sys.exit(1)
     else:
-        LaunchingWindow(app, version=version, version_query=query, blendfile=file, open_last=open_last).show()
+        LaunchingWindow(app, version_query=query, blendfile=file, open_last=open_last).show()
         sys.exit(app.exec())
 
 

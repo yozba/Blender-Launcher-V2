@@ -5,7 +5,6 @@ import os
 import shlex
 import shutil
 import sys
-import threading
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -32,7 +31,6 @@ from modules.platform_utils import (
 )
 from modules.settings import (
     create_library_folders,
-    get_check_for_new_builds_automatically,
     get_check_for_new_builds_on_startup,
     get_default_downloads_page,
     get_default_library_page,
@@ -45,7 +43,6 @@ from modules.settings import (
     get_launch_minimized_to_tray,
     get_library_folder,
     get_make_error_popup,
-    get_new_builds_check_frequency,
     get_proxy_type,
     get_purge_temp_on_startup,
     get_scrape_bfa_builds,
@@ -63,6 +60,7 @@ from modules.settings import (
     get_show_upbge_weekly_builds,
     get_sync_library_and_downloads_pages,
     get_tray_icon_notified,
+    get_use_nohup,
     get_use_pre_release_builds,
     get_use_system_titlebar,
     get_window_geometry,
@@ -76,7 +74,7 @@ from modules.settings import (
     set_window_maximized,
 )
 from modules.tasks import TaskQueue, TaskWorker
-from PySide6.QtCore import QMetaMethod, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QMetaMethod, QSize, Qt, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -136,9 +134,21 @@ class BlenderLauncher(BaseWindow):
         build_cache: bool = False,
         force_first_time: bool = False,
     ):
-        super().__init__(app=app, version=version)
+        super().__init__()
         self.resize(800, 700)
         self.setMinimumSize(QSize(640, 480))
+
+        # Global scope
+        self.app = app
+        self.version: Version = version
+        self.offline = offline
+        self.build_cache = build_cache
+        self.app_state = AppState.IDLE
+        self.just_started = True
+        self.latest_tag = ""
+        self.new_downloads = False
+        self.platform = get_platform()
+        self.settings_window = None
 
         # Restore saved window geometry
         geometry = get_window_geometry()
@@ -151,6 +161,7 @@ class BlenderLauncher(BaseWindow):
         self.CentralLayout.setContentsMargins(1, 1, 1, 1)
         self.setCentralWidget(widget)
         self.setAcceptDrops(True)
+
 
         # Server
         self.instance_handler = BLInstanceHandler(self.version, self)
@@ -171,26 +182,17 @@ class BlenderLauncher(BaseWindow):
         )
         self.task_queue.start()
 
-        # Global scope
-        self.app = app
-        self.version: Version = version
-        self.offline = offline
-        self.build_cache = build_cache
-        self.app_state = AppState.IDLE
-        self.windows: list[BaseWindow] = [self]
-        self.timer = None
-        self.started = True
-        self.latest_tag = ""
-        self.new_downloads = False
-        self.platform = get_platform()
-        self.settings_window = None
-
         if self.platform == "macOS":
             self.app.aboutToQuit.connect(self.quit_)
 
         # Setup window
         self.setWindowTitle("Blender Launcher")
         self.app.setWindowIcon(self.icons.taskbar)
+
+        # Pool Manager
+        self.cm = ConnectionManager(version=version)
+        self.cm.setup()
+        self.manager = self.cm.manager
 
         # Setup scraper
         self.scraper = Scraper(self, self.cm, self.build_cache)
@@ -199,6 +201,7 @@ class BlenderLauncher(BaseWindow):
         self.scraper.stable_error.connect(self.scraper_error)
         self.scraper.new_bl_version.connect(self.set_version)
         self.scraper.finished.connect(self.scraper_finished)
+        self.scraper.timer.timeout.connect(self.start_scraper)
 
         # Vesrion Update
         self.pre_release_build = get_use_pre_release_builds
@@ -207,7 +210,6 @@ class BlenderLauncher(BaseWindow):
             dlg = Popup.error(
                 message=t("msg.err.no_resources"),
                 buttons=[Popup.Button.OK, Popup.Button.DONT_SHOW_AGAIN],
-                parent=self,
             )
             dlg.cancelled.connect(set_dont_show_resource_warning)
 
@@ -228,7 +230,6 @@ class BlenderLauncher(BaseWindow):
                 icon=Popup.Icon.INFO,
                 message=t("msg.popup.first_time_select_library"),
                 buttons=Popup.Button.CONT,
-                parent=self,
             )
             self.dlg.accepted.connect(self.prompt_library_folder)
             return
@@ -262,7 +263,6 @@ class BlenderLauncher(BaseWindow):
                 self.dlg = Popup.setup(
                     message=t("msg.popup.relative_path_found"),
                     buttons=Popup.Button.yn(),
-                    parent=self,
                 )
                 self.dlg.accepted.connect(lambda: self.set_library_folder(folder, True))
                 self.dlg.cancelled.connect(lambda: self.set_library_folder(folder, False))
@@ -275,14 +275,13 @@ class BlenderLauncher(BaseWindow):
             self.draw(True)
         else:
             self.dlg = Popup.warning(
-                parent=self,
                 message=t("msg.err.folder_invalid"),
                 buttons=Popup.Button.RETRY,
             )
             self.dlg.accepted.connect(self.prompt_library_folder)
 
     def update_system_titlebar(self, b: bool):
-        for window in self.windows:
+        for window in self.window_collection:
             window.set_system_titlebar(b)
             if window is not self:
                 window.update_system_titlebar(b)
@@ -488,7 +487,6 @@ class BlenderLauncher(BaseWindow):
         if not self.is_downloading_idle():
             self.dlg = Popup.warning(
                 message=t("msg.updates.download_before_update"),
-                parent=self,
                 buttons=Popup.Button.info(),
             )
 
@@ -524,7 +522,10 @@ class BlenderLauncher(BaseWindow):
             _popen([dist.as_posix(), "--instanced", "update", self.latest_tag], no_console=False)
         elif self.platform == "Linux":
             os.chmod(dist.as_posix(), 0o744)
-            _popen(f'nohup "{dist.as_posix()}" --instanced update {self.latest_tag}')
+            if get_use_nohup():
+                _popen(f'nohup "{dist.as_posix()}" --instanced update {self.latest_tag}')
+            else:
+                _popen(f'"{dist.as_posix()}" --instanced update {self.latest_tag}')
 
         # Destroy currently running Blender Launcher instance
         self.quit_()
@@ -561,7 +562,7 @@ class BlenderLauncher(BaseWindow):
         #     self.toolbar_quit_btn.clicked.connect(self.quit_)
         #     self.thumbnail_toolbar.addButton(self.toolbar_quit_btn)
 
-    def show_message(self, message: str, value=None, message_type: MessageType | None = None):
+    def show_message(self, message: str, message_type: MessageType | None = None):
         if (
             (message_type == MessageType.DOWNLOADFINISHED and not get_enable_download_notifications())
             or (message_type == MessageType.NEWBUILDS and not get_enable_new_builds_notifications())
@@ -572,7 +573,7 @@ class BlenderLauncher(BaseWindow):
         self.tray_handler.message(message)
 
     def message_from_error(self, err: Exception):
-        self.show_message(t("msg.err.generic", err=err), MessageType.ERROR)
+        self.show_message(t("msg.err.generic", err=err), message_type=MessageType.ERROR)
         logger.error(err)
 
     def message_from_worker(self, w, message, message_type=None):
@@ -588,33 +589,9 @@ class BlenderLauncher(BaseWindow):
         self.TabWidget.setCurrentWidget(self.UserTab)
         self._show()
 
-    def stop_auto_scrape_timer(self):
-        if self.timer is not None:
-            self.timer.cancel()
-            self.timer = None
-
-    def schedule_auto_scrape_timer(self):
-        self.stop_auto_scrape_timer()
-
-        if not get_check_for_new_builds_automatically():
-            return
-
-        interval_seconds = get_new_builds_check_frequency() * 3600
-
-        if interval_seconds <= 0:
-            return
-
-        def trigger_auto_scrape():
-            self.timer = None
-            QTimer.singleShot(0, self.draw_downloads)
-
-        self.timer = threading.Timer(interval_seconds, trigger_auto_scrape)
-        self.timer.daemon = True
-        self.timer.start()
-
     def _destroyed(self, *args, **kwargs):
         super()._destroyed()
-        self.stop_auto_scrape_timer()
+        self.scraper.stop_timer()
         self.task_queue.fullstop()
         self.app.quit()
 
@@ -627,12 +604,11 @@ class BlenderLauncher(BaseWindow):
             self.cm.error.connect(self.connection_error)
             self.manager = self.cm.manager
 
-            self.stop_auto_scrape_timer()
-            if self.scraper is not None:
-                self.scraper.quit()
+            self.scraper.stop_timer()
+            self.scraper.quit()
 
             self.DownloadsPage.list_widget.clear_()
-            self.started = True
+            self.just_started = True
 
         self.quick_launch_handler.reset()
 
@@ -643,6 +619,8 @@ class BlenderLauncher(BaseWindow):
         self.library_drawer.unrecognized.connect(self.draw_unrecognized)
         if not self.offline:
             self.library_drawer.finished.connect(self.draw_downloads)
+        else:
+            self.library_drawer.finished.connect(self.library_drawing_finished)
 
         self.task_queue.append(self.library_drawer)
 
@@ -652,6 +630,9 @@ class BlenderLauncher(BaseWindow):
         self.library_drawer.found.connect(self.draw_to_library)
         self.library_drawer.unrecognized.connect(self.draw_unrecognized)
         self.task_queue.append(self.library_drawer)
+
+    def library_drawing_finished(self):
+        self.status_bar.set_status("", force_check_on=False)
 
     def draw_downloads(self):
         if get_check_for_new_builds_on_startup():
@@ -675,8 +656,7 @@ class BlenderLauncher(BaseWindow):
         self.status_bar.set_status(t("msg.err.connection_failed", time=utcnow))
         self.app_state = AppState.IDLE
 
-        if get_check_for_new_builds_automatically() is True:
-            self.schedule_auto_scrape_timer()
+        self.scraper.start_timer_if_allowed()
 
     @Slot(str)
     def scraper_error(self, s: str):
@@ -694,7 +674,7 @@ class BlenderLauncher(BaseWindow):
 
     def start_scraper(self, scrape_all_visible=False):
         self.status_bar.set_status(t("act.prog.checking"), False)
-        self.stop_auto_scrape_timer()
+        self.scraper.stop_timer()
 
         scrape_stable = get_scrape_stable_builds()
         scrape_daily = get_scrape_daily_builds()
@@ -739,12 +719,9 @@ class BlenderLauncher(BaseWindow):
 
         self.app_state = AppState.IDLE
 
-        if get_check_for_new_builds_automatically() is True:
-            self.schedule_auto_scrape_timer()
-            self.started = False
-        else:
-            self.stop_auto_scrape_timer()
+        self.just_started = False
         self.ready_to_scrape()
+        self.scraper.start_timer_if_allowed()
 
     def ready_to_scrape(self):
         self.app_state = AppState.IDLE
@@ -755,26 +732,28 @@ class BlenderLauncher(BaseWindow):
         self.scraper_finished_signal.emit()
 
     def draw_to_downloads(self, build_info: BuildInfo):
-        if self.started and build_info.commit_time < self.scraper.last_time_checked:
-            is_new = False
-        else:
-            is_new = True
+        if self.DownloadsPage.list_widget.contains_build_info(build_info):
+            return
 
-        if not self.DownloadsPage.list_widget.contains_build_info(build_info):
-            installed = self.LibraryPage.list_widget.widget_with_blinfo(build_info)
-            item = BaseListWidgetItem(build_info.commit_time)
-            widget = DownloadWidget(
-                self,
-                self.DownloadsPage.list_widget,
-                item,
-                build_info,
-                installed=installed,
-                show_new=is_new,
-            )
-            widget.focus_installed_widget.connect(self.focus_widget)
-            self.DownloadsPage.list_widget.add_item(item, widget)
-            if is_new:
-                self.new_downloads = True
+        item = BaseListWidgetItem(build_info.commit_time)
+        installed = self.LibraryPage.list_widget.widget_with_blinfo(build_info)
+        # Don't show new builds on start
+        is_new = (not self.just_started) and build_info.commit_time > self.scraper.last_time_checked
+
+        widget = DownloadWidget(
+            self,
+            self.DownloadsPage.list_widget,
+            item,
+            build_info,
+            installed=installed,
+            show_new=is_new,
+        )
+        widget.focus_installed_widget.connect(self.focus_widget)
+        widget.task.connect(self.task_queue.append)
+        widget.cancel_task.connect(self.task_queue.remove_task)
+        self.DownloadsPage.list_widget.add_item(item, widget)
+
+        self.new_downloads |= is_new
 
     def draw_to_library(self, path: Path, show_new=False, successful_read_callback=None):
         branch = Path(path).parent.name
@@ -810,6 +789,7 @@ class BlenderLauncher(BaseWindow):
         item = BaseListWidgetItem()
         widget = LibraryWidget(self, item, path, self.LibraryPage.list_widget, binfo, show_new)
         widget.add_as_quick_launch.connect(self.quick_launch_handler.add_quick_launch_build)
+        widget.task.connect(self.task_queue.append)
         if widget.is_quick_launch():
             widget.add_to_quick_launch()
 
@@ -828,6 +808,7 @@ class BlenderLauncher(BaseWindow):
 
         item = BaseListWidgetItem()
         widget = LibraryDamagedWidget(self, item, path, self.LibraryPage.list_widget)
+        widget.task.connect(self.task_queue.append)
 
         self.LibraryPage.list_widget.insert_item(item, widget)
         return widget
@@ -852,6 +833,8 @@ class BlenderLauncher(BaseWindow):
 
         item = BaseListWidgetItem()
         widget = UnrecoBuildWidget(self, path, self.LibraryPage.list_widget, item)
+        widget.announce_build.connect(lambda p: self.draw_to_library(p, True))
+        widget.task.connect(self.task_queue.append)
 
         self.LibraryPage.list_widget.insert_item(item, widget)
 
@@ -914,7 +897,6 @@ class BlenderLauncher(BaseWindow):
             popup = Popup.UpdateNotification(
                 latest_tag=latest_tag,
                 version_notes=version_notes,
-                parent=self,
             )
             popup.accepted.connect(self.show_update_window)
 
@@ -936,7 +918,6 @@ class BlenderLauncher(BaseWindow):
             self.dlg = Popup.warning(
                 message=t("msg.popup.tasks_in_progress", tasks="\n".join([f" - {item}<br>" for item in busy.values()])),
                 buttons=Popup.Button.yn(),
-                parent=self,
             )
 
             self.dlg.accepted.connect(self._force_quit)
@@ -968,7 +949,7 @@ class BlenderLauncher(BaseWindow):
     def _save_window_geometry(self):
         set_window_maximized(self.isMaximized())
         if not self.isMaximized():
-            set_window_geometry(self.saveGeometry().data())
+            set_window_geometry(bytes(self.saveGeometry().data()))
 
     def closeEvent(self, event):
         self._save_window_geometry()
@@ -997,7 +978,7 @@ class BlenderLauncher(BaseWindow):
         elif self.platform == "Linux":
             exe = (cwd / "Blender Launcher").as_posix()
             os.chmod(exe, 0o744)
-            _popen('nohup "' + exe + '" -instanced')
+            _popen('"' + exe + '" -instanced')
         elif self.platform == "macOS":
             # sys.executable should be something like /.../Blender Launcher.app/Contents/MacOS/Blender Launcher
             app = Path(sys.executable).parent.parent.parent
